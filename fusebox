@@ -1,0 +1,456 @@
+#!/usr/bin/perl
+use Config::Simple;
+use Fuse qw(fuse_get_context);
+use POSIX qw(ENOENT EISDIR EINVAL floor);
+use Crypt::CBC;
+use Crypt::OpenSSL::AES;
+use Data::Dumper;
+use File::Path qw(make_path);
+use File::Basename qw(dirname basename);
+use constant BLOCKSIZE => 16;
+use MIME::Base64;
+use POSIX qw(ENOENT EISDIR);
+use IO::File;
+use bytes;
+use strict;
+
+#
+# this string is prepended to all filenames to indicate that the
+# file or directory is secured. Fusebox will ignore files whose names
+# don't start with this string:
+#
+my $_PREFIX = '.fusebox_';
+
+#
+# config file: this is where we store our settings:
+#
+my $RCFILE = sprintf('%s/.fuseboxrc', $ENV{'HOME'});
+
+if (!-e $RCFILE) {
+	print STDERR "Error: $RCFILE not found.\n";
+	exit 1;
+}
+
+my $config = Config::Simple->new($RCFILE);
+
+#
+# create the mountpoint if it doesn't exist yet:
+#
+unless (-e $config->param('mountpoint')) {
+	my $err;
+	make_path(
+		$config->param('mountpoint'),
+		{
+			'mode' => 0700,
+			'error' => \$err,
+		}
+	);
+	if (@{$err}) {
+		map { printf(STDERR "Error: %s\n", $_) } @{$err};
+		exit 1;
+	}
+}
+
+#
+# We need an initialization vector: either get it from the
+# config file or generate one (and save it back to the config file):
+#
+my $iv;
+if ($config->param('iv')) {
+	$iv = _decode($config->param('iv'));
+
+} else {
+	$iv = Crypt::CBC->random_bytes(BLOCKSIZE);
+	$config->param('iv', _encode($iv));
+	$config->save;
+
+}
+
+#
+# set up our cipher:
+#
+my $cipher = Crypt::CBC->new(
+	'-key'		=> $config->param('passphrase'),
+	'-iv'		=> $iv,
+	'-header'	=> 'none',
+	'-cipher'	=> 'Crypt::OpenSSL::AES',
+);
+
+#
+# Fuse initialisation:
+#
+Fuse::main(
+	'debug'		=> 0,
+	'threaded'	=> 0,
+
+	'mountpoint'	=> $config->param('mountpoint'),
+
+#	'access'	=> "main::fb_access",
+#	'bmap'		=> "main::fb_bmap",
+#	'chmod'		=> "main::fb_chmod",
+#	'chown'	 	=> "main::fb_chown",
+	'create'	=> "main::fb_create",
+#	'destroy'	=> "main::fb_destroy",
+#	'fgetattr'	=> "main::fb_fgetattr",
+#	'flush'		=> "main::fb_flush",
+#	'fsyncdir'	=> "main::fb_fsyncdir",
+#	'fsync'	 	=> "main::fb_fsync",
+#	'ftruncate'	=> "main::fb_ftruncate",
+	'getattr'	=> "main::fb_getattr",
+	'getdir'	=> "main::fb_getdir",
+#	'getxattr'	=> "main::fb_getxattr",
+#	'init'	 	=> "main::fb_init",
+#	'link'		=> "main::fb_link",
+#	'listxattr'	=> "main::fb_listxattr",
+#	'lock'		=> "main::fb_lock",
+	'mkdir'	 	=> "main::fb_mkdir",
+#	'mknod'	 	=> "main::fb_mknod",
+#	'opendir'	=> "main::fb_opendir",
+	'open'		=> "main::fb_open",
+#	'readdir'	=> "main::fb_readdir",
+#	'readlink'	=> "main::fb_readlink",
+	'read'		=> "main::fb_read",
+#	'releasedir'	=> "main::fb_releasedir",
+#	'release'	=> "main::fb_release",
+#	'removexattr'	=> "main::fb_removexattr",
+	'rename'	=> "main::fb_rename",
+#	'rmdir'	 	=> "main::fb_rmdir",
+#	'setxattr'	=> "main::fb_setxattr",
+#	'statfs'	=> "main::fb_statfs",
+#	'symlink'	=> "main::fb_symlink",
+	'truncate'	=> "main::fb_truncate",
+	'unlink'	=> "main::fb_unlink",
+	'utime'		=> "main::fb_utime",
+#	'utimens'	=> "main::fb_utimens",
+	'write'		=> "main::fb_write",
+);
+
+#
+# helper functions:
+#
+
+#
+# encode some binary data in human-readable format
+# basically a wrapper around MIME::Base64::encode_base64
+# strips out some characters that are illegal in filenames
+#
+sub _encode {
+	my $data = shift;
+	my $encoded = encode_base64($data, '');
+	$encoded =~ s!/!_!g;
+	return $encoded;
+}
+
+#
+# decode some previously encoded data
+#
+sub _decode {
+	my $encoded = shift;
+	$encoded =~ s!_!/!g;
+	return decode_base64($encoded);
+}
+
+#
+# encrypt a filename
+# the scalar return is base64 encoded
+#
+sub _encrypt_filename { _encode($cipher->encrypt(shift)) }
+
+#
+# decrypt a filename
+# the argument should be base64 encoded
+#
+sub _decrypt_filename { $cipher->decrypt(_decode(shift)) }
+
+#
+# encrypt some data
+#
+sub _encrypt_data { $cipher->encrypt(shift) }
+
+#
+# decrypt some data
+#
+sub _decrypt_data { $cipher->decrypt(shift) }
+
+#
+# turn a relative path into a full path
+#
+sub _fullpath {
+	my $path = shift;
+#	print STDERR "_fullpath() called on '$path'\n";
+	$path = $config->param('dropbox').$path;
+#	print STDERR "path='$path'\n";
+	return $path;
+}
+
+#
+# check if a filename is secure (encrypted)
+#
+sub _is_secure {
+#	print STDERR "_PREFIX=$_PREFIX\n";
+	my $file = shift;
+	if (basename($file) =~ /^$_PREFIX/) {
+#		print STDERR "file='$file' secure\n";
+		return 1;
+	} else {
+#		print STDERR "file='$file' insecure\n";
+		return undef;
+	}
+}
+
+#
+# turn a secure (encrypted) filename into a normal filename
+#
+sub _get_name {
+	my $path = shift;
+	my @parts = split(/\//, $path);
+
+	my $name;
+	foreach my $part (@parts) {
+		if (_is_secure($part)) {
+			$part =~ s/^$_PREFIX//;
+			$name .= (scalar(@parts) > 1 ? '/' : '')._decrypt_filename($part);
+		}
+	}
+	return $name;
+}
+
+#
+# turn a normal filename into a secure (encrypted) filename
+#
+sub _secure_name {
+	my $path = shift;
+
+	return $path if ($path eq '/');
+
+	my @parts = grep { $_ ne '' } split(/\//, $path);
+
+	my $name;
+	map { $name .= (scalar(@parts) > 1 ? '/' : '').$_PREFIX._encrypt_filename($_) } @parts;
+
+	return '/'.$name;
+}
+
+#
+# Fuse functions:
+#
+
+#
+# of course, the file size returned here will be wrong (but will
+# never be smaller than the true file size due to padding):
+#
+sub fb_getattr {
+	my $path = shift;
+#	print STDERR "gb_getattr() called on '$path'\n";
+#	print STDERR "secure name='$path'\n";
+	$path = _secure_name($path);
+#	print STDERR "full path='$path'\n";
+	$path = _fullpath($path);
+	return stat($path);
+}
+
+#
+# get the contents of a directory:
+#
+sub fb_getdir {
+	my $dir = shift;
+#	print STDERR "fb_getdir() called on '$dir'\n";
+	$dir = _fullpath($dir);
+#	print STDERR "full path='$dir'\n";
+
+	my @nodes = ('.');
+	opendir(DIR, $dir);
+	map { push(@nodes, _get_name($_)) if (_is_secure($_)) } readdir(DIR);
+	closedir(DIR);
+#	map { print STDERR $_."\n"; } @nodes;
+	return (@nodes, 0);
+}
+
+#
+# open a file (this just mocks the process):
+#
+sub fb_open {
+	my ($file, $flags, $fileinfo) = @_;
+#	print STDERR "opened '$file'\n";
+	return -ENOENT() unless (-e _fullpath(_secure_name($file)));
+	return -EISDIR() if (-d _fullpath(_secure_name($file)));
+	return (0, [int(rand(2**32))]);
+}
+
+# what this needs to do: read and decrypt the file until $offset is
+# reached. then discard the buffer, and continue until $offset+$length
+# is reached. then return the buffer.
+#
+sub fb_read {
+	my ($file, $length, $offset, $handle) = @_;
+#	printf(STDERR "read %s from %d to %d (%d bytes)\n", $file, $offset, $offset+$length, $length);
+
+	my $path = _fullpath(_secure_name($file));
+#	print STDERR "path=$path\n";
+
+	my $fh = IO::File->new;
+	if (!$fh->open($path)) {
+		print STDERR "Error opening $path: $!\n";
+		exit 1;
+	}
+	$fh->binmode;
+
+	my $buffer = '';
+
+	if ($offset > 0) {
+		# seek through the file to the beginning of the block which
+		# contains the first byte we want to read:
+		my $seek_to = $offset - ($offset % BLOCKSIZE);
+#		printf(STDERR "seek to %d\n", $seek_to);
+		$fh->seek($seek_to, 0);
+
+		# read from the first byte until the end of the first block:
+		if ($seek_to < $offset) {
+			my $tmp;
+#			printf(STDERR "asking for %d bytes from file\n", BLOCKSIZE);
+			$fh->read($tmp, BLOCKSIZE);
+#			printf(STDERR "got %d bytes\n", length($tmp));
+			$buffer = substr(_decrypt_data($tmp), $offset-$seek_to);
+#			printf(STDERR "appended %d bytes to buffer\n", length($buffer));
+#			printf(STDERR "buffer size is now %d bytes\n", length($buffer));
+		}
+	}
+
+	# read on:
+	my $read_to = BLOCKSIZE * floor($length / BLOCKSIZE);
+#	printf(STDERR "asking for %d bytes from file\n", $read_to);
+	my $tmp;
+	$fh->read($tmp, $read_to);
+#	printf(STDERR "got %d bytes\n", length($tmp));
+	my $ptext .= _decrypt_data($tmp);
+	$buffer .= $ptext;
+#	printf(STDERR "appended %d bytes to buffer\n", length($ptext));
+#	printf(STDERR "buffer size is now %d bytes\n", length($buffer));
+
+	# if the data continues into the next block, read it and append:
+	if ($read_to < $length) {
+		my $tmp;
+#		printf(STDERR "asking for %d bytes from file\n", BLOCKSIZE);
+		$fh->read($tmp, BLOCKSIZE);
+#		printf(STDERR "got %d bytes\n", length($tmp));
+		my $ptext = substr(_decrypt_data($tmp), 0, $length-$read_to);
+		$buffer .= $ptext;
+#		printf(STDERR "appended %d bytes to buffer\n", length($ptext));
+#		printf(STDERR "buffer size is now %d bytes\n", length($buffer));
+	}
+
+	$fh->close;
+
+#	printf(STDERR "Returning %d bytes", length($buffer));
+	return $buffer;
+}
+
+sub old_fb_read {
+	my ($file, $length, $offset, $handle) = @_;
+	my $path = _fullpath(_secure_name($file));
+
+	if (!open(FILE, $path)) {
+		print STDERR "Error opening $path: $!\n";
+		exit 1;
+	}
+
+	#
+	# this reads the entire file into memory!
+	#
+	local $/ = undef;
+	my $ciphertext = <FILE>;
+	close(FILE);
+
+	return substr(_decrypt_filename($ciphertext), $offset, $length);
+}
+
+#
+# write data to a file:
+#
+sub fb_write {
+	my ($path, $buffer, $offset, $handle) = @_;
+	printf(STDERR "writing %d bytes to %s at position %d\n", length($buffer), $path, $offset);
+	$path = _fullpath(_secure_name($path));
+
+#	printf(STDERR "\tbuffer is this: '%s'\n", $buffer);
+
+	my $fh = IO::File->new;
+	if (!$fh->open($path, '+<')) {
+		print STDERR "Error opening $path: $!\n";
+		exit 1;
+	}
+	$fh->binmode;
+
+	if ($offset > 0) {
+		# seek to the beginning of the block in which the first byte appears:
+		my $seek_to = $offset - ($offset % BLOCKSIZE);
+		printf(STDERR "\tseek to %d\n", $seek_to);
+		$fh->seek($seek_to, 0);
+
+		if ($seek_to <= $offset) {
+			printf(STDERR "\tBlock subsection is %d bytes\n", $offset-$seek_to);
+
+			# read the block:
+			my $tmp;
+			$fh->read($tmp, BLOCKSIZE);
+			printf(STDERR "\tgot %d bytes of ciphertext\n", length($tmp));
+
+			# decrypt the block:
+			my $ptext = _decrypt_data($tmp);
+#			printf(STDERR "\tgot this: '%s'\n", $ptext);
+
+			# prepend the part of the block before the first byte:
+#			printf(STDERR "\twant this: '%s'\n", substr($ptext, 0, $offset-$seek_to));
+			printf(STDERR "\tprepended %d bytes to buffer\n", $offset-$seek_to);
+			$buffer = substr($ptext, 0, $offset-$seek_to).$buffer;
+			printf(STDERR "\tnew buffer size is %d bytes\n", length($buffer));
+
+			# seek back to the beginning of the block:
+			$fh->seek($seek_to, 0);
+		}
+	}
+
+#	printf(STDERR "\tbuffer is this: '%s'\n", $buffer);
+	my $ctext = _encrypt_data($buffer);
+	printf(STDERR "\tWriting %d bytes of ciphertext to file\n", length($ctext));
+
+	$fh->print($ctext);
+	$fh->close;
+
+	return length($buffer);
+}
+
+#
+# truncate a file:
+#
+sub fb_truncate {
+	my ($path, $offset) = @_;
+	print STDERR "asked to truncate '$path' from position '$offset'\n";
+	$path = _fullpath(_secure_name($path));
+	if (0 == $offset) {
+		return (truncate($path, 0) ? 0 : -1);
+
+	} else {
+		# TODO: implement this bit:
+		return -1;
+	}
+}
+
+sub fb_unlink { (1 == unlink(_fullpath(_secure_name(shift))) ? 0 : -1) }
+
+sub fb_rename { (rename(_fullpath(_secure_name(shift)), _fullpath(_secure_name(shift))) ? 0 : -1) }
+
+sub fb_utime {
+	my ($path, $atime, $mtime) = @_;
+	return (utime($atime, $mtime, _fullpath(_secure_name($path))) == 1 ? 0 : -1);
+}
+
+sub fb_create {
+	my ($path, $mask, $flags) = @_;
+	my $fh = IO::File->new;
+	$fh->open(_fullpath(_secure_name($path)), 'w');
+	$fh->close;
+	return (0, [int(rand(2**32))]);
+}
+
+sub fb_mkdir { (1 == mkdir(_fullpath(_secure_name(shift))) ? 0 : -1) }

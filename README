@@ -1,0 +1,38 @@
+README
+======
+
+Fusebox is a highly experimental, pre-pre-alpha attempt to provide 
+end-to-end security for Dropbox.
+
+Some users of the Dropbox.com service are worried that the operators of 
+that service are able to view their files. To alleviate these fears, 
+Fusebox works as a proxy for the Dropbox service: it presents itself as 
+a separate filesystem on your computer. When a file is created on this 
+filesystem, the file's name and contents are encrypted using symmetric 
+AES encryption, and placed in your normal Dropbox folder. The Dropbox 
+system itself is then responsible for syncing the files to the Dropbox 
+server, and the other devices you have connected to your account.
+
+Fusebox is a Perl script that uses the Fuse module to implement a 
+userspace filesystem, and the Crypt::CBC and Crypt::OpenSSL::AES modules 
+to do the encryption.
+
+To use it, you will need a .fuseboxrc file that looks like this:
+
+mountpoint=/media/fusebox
+dropbox=/your/home/directory/Dropbox
+passphrase=[nice strong passphrase]
+
+when Fusebox first runs, it will edit this file to include a random 
+"initialisation vector". This has to be stored with the passphrase so 
+that encrypted filenames don't change.
+
+If you (securely) copy this file to another machine that's linked to 
+your Dropbox account, it will also be able to read the encrypted files.
+
+DISCLAIMER
+==========
+
+This program is offered with no warranty: I am not a crypto geek, I just 
+assemble small bits of other people's code! If you know a bit about 
+crypto, please dig in and fix bugs.
